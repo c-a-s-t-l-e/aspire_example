@@ -52,11 +52,13 @@ ui <- navbarPage(
   tabPanel(
     "Graphs",
     page_sidebar(
+      # Replace the existing Graphs tabPanel sidebar content with:
       sidebar = sidebar(
         selectInput("plot_type", "Plot Type:",
                     choices = c("Scatter Plot", "Box Plot", "Histogram", "Bar Plot")),
         uiOutput("column_selector"),
         uiOutput("plot_options"),
+        uiOutput("aesthetic_controls"),  # New UI output for aesthetic controls
         textInput("plot_title", "Plot Title:", value = "My Plot"),
         textInput("x_axis_label", "X-axis Label:", value = "X"),
         textInput("y_axis_label", "Y-axis Label:", value = "Y"),
@@ -83,13 +85,17 @@ ui <- navbarPage(
                       value = "This report summarizes the analysis of our dataset."),
         actionButton("save_current_plot", "Add Current Plot to Report", class = "btn-success"),
         hr(),
-        checkboxInput("include_data_summary", "Include Data Summary", TRUE),
         checkboxInput("include_stats", "Include Statistical Analysis", TRUE),
+        actionButton("clear_report", "Clear Report", class = "btn-danger"),
+        hr(),
         downloadButton("download_report", "Download Report", class = "btn-primary")
       ),
       card(
         card_header("Report Preview"),
         card_body(
+          h2(textOutput("preview_title")),
+          pre(style = "white-space: pre-wrap; font-family: inherit;", textOutput("preview_description")),
+          hr(),
           uiOutput("saved_plots_preview"),
           verbatimTextOutput("report_preview")
         )
@@ -136,53 +142,71 @@ server <- function(input, output, session) {
   })
   
   # Render column selector grouped by type
+  # Add this output in the Data Selection tab's UI
   output$column_selector_by_type <- renderUI({
+    req(current_data())
     cols_by_type <- get_columns_by_type()
     
     tagList(
-      if(length(cols_by_type$numeric) > 0) {
-        card(
-          card_header("Numeric Columns"),
-          checkboxGroupInput("selected_numeric", NULL,
-                             choices = cols_by_type$numeric,
-                             selected = cols_by_type$numeric)
-        )
-      },
-      if(length(cols_by_type$factor) > 0) {
-        card(
-          card_header("Factor Columns"),
-          checkboxGroupInput("selected_factor", NULL,
-                             choices = cols_by_type$factor,
-                             selected = cols_by_type$factor)
-        )
-      },
-      if(length(cols_by_type$character) > 0) {
-        card(
-          card_header("Character Columns"),
-          checkboxGroupInput("selected_character", NULL,
-                             choices = cols_by_type$character,
-                             selected = cols_by_type$character)
-        )
-      },
-      if(length(cols_by_type$other) > 0) {
-        card(
-          card_header("Other Columns"),
-          checkboxGroupInput("selected_other", NULL,
-                             choices = cols_by_type$other,
-                             selected = cols_by_type$other)
-        )
-      }
+      checkboxGroupInput("selected_numeric", "Numeric Columns:",
+                         choices = cols_by_type$numeric,
+                         selected = cols_by_type$numeric),
+      checkboxGroupInput("selected_factor", "Factor Columns:",
+                         choices = cols_by_type$factor,
+                         selected = cols_by_type$factor),
+      checkboxGroupInput("selected_character", "Character Columns:",
+                         choices = cols_by_type$character,
+                         selected = cols_by_type$character),
+      checkboxGroupInput("selected_other", "Other Columns:",
+                         choices = cols_by_type$other,
+                         selected = cols_by_type$other)
     )
   })
   
   # Combine all selected columns
+  # Update the selected_cols reactive
   selected_cols <- reactive({
-    c(
+    req(current_data())
+    unique(c(
       input$selected_numeric,
       input$selected_factor,
       input$selected_character,
       input$selected_other
-    )
+    ))
+  })
+  
+  # Update the observe block that applies filters
+  observe({
+    req(current_data())
+    data <- current_data()
+    cols <- selected_cols()
+    
+    if (length(cols) > 0) {
+      filtered <- data
+      
+      for (col in cols) {
+        filter_input <- input[[paste0("filter_", col)]]
+        
+        if (!is.null(filter_input)) {
+          if (is.numeric(data[[col]])) {
+            filtered <- filtered[
+              filtered[[col]] >= filter_input[1] & 
+                filtered[[col]] <= filter_input[2], , drop = FALSE
+            ]
+          } else if (is.factor(data[[col]]) || is.character(data[[col]])) {
+            if (length(filter_input) > 0) {
+              filtered <- filtered[filtered[[col]] %in% filter_input, , drop = FALSE]
+            }
+          }
+        }
+      }
+      
+      filtered_data(filtered)
+      global_filtered_data(filtered)
+    } else {
+      filtered_data(data)
+      global_filtered_data(data)
+    }
   })
   
   # Generate dynamic filters
@@ -284,9 +308,32 @@ server <- function(input, output, session) {
   })
   
   output$plot_options <- renderUI({
+    req(input$plot_type, filtered_data())
+    
     if (input$plot_type == "Histogram") {
-      sliderInput("bins", "Number of bins:", min = 5, max = 50, value = 30)
+      tagList(
+        sliderInput("bins", "Number of bins:", min = 5, max = 50, value = 30),
+        checkboxInput("density", "Show density curve", FALSE)
+      )
+    } else if (input$plot_type == "Bar Plot") {
+      checkboxInput("sort_bars", "Sort bars by frequency", TRUE)
     }
+  })
+  
+  output$aesthetic_controls <- renderUI({
+    req(filtered_data())
+    data <- filtered_data()
+    num_cols <- names(data)[sapply(data, is.numeric)]
+    cat_cols <- names(data)[sapply(data, function(x) is.factor(x) || is.character(x))]
+    
+    tagList(
+      selectInput("color_by", "Color by:", 
+                  choices = c("(None)" = "", cat_cols)),
+      selectInput("size_by", "Size by:", 
+                  choices = c("(None)" = "", num_cols)),
+      selectInput("facet_by", "Facet by:", 
+                  choices = c("(None)" = "", cat_cols))
+    )
   })
   
   current_plot <- reactive({
@@ -296,39 +343,108 @@ server <- function(input, output, session) {
     p <- switch(input$plot_type,
                 "Scatter Plot" = {
                   req(input$y_var)
-                  ggplot(data, aes_string(x = input$x_var, y = input$y_var)) +
+                  p <- ggplot(data)
+                  
+                  # Build aesthetics based on selected options
+                  aes_list <- list(x = as.name(input$x_var), 
+                                   y = as.name(input$y_var))
+                  
+                  if (input$color_by != "") {
+                    aes_list$color <- as.name(input$color_by)
+                  }
+                  if (input$size_by != "") {
+                    aes_list$size <- as.name(input$size_by)
+                  }
+                  
+                  p + do.call(aes, aes_list) +
                     geom_point() +
                     theme_minimal()
                 },
                 "Box Plot" = {
-                  ggplot(data, aes_string(y = input$x_var)) +
+                  p <- ggplot(data)
+                  
+                  # Build aesthetics for box plot
+                  aes_list <- list(y = as.name(input$x_var))
+                  if (input$color_by != "") {
+                    aes_list$x <- as.name(input$color_by)
+                    aes_list$fill <- as.name(input$color_by)
+                  }
+                  
+                  p + do.call(aes, aes_list) +
                     geom_boxplot() +
                     theme_minimal()
                 },
                 "Histogram" = {
-                  ggplot(data, aes_string(x = input$x_var)) +
-                    geom_histogram(bins = input$bins) +
+                  p <- ggplot(data)
+                  
+                  # Build aesthetics for histogram
+                  aes_list <- list(x = as.name(input$x_var))
+                  if (input$color_by != "") {
+                    aes_list$fill <- as.name(input$color_by)
+                  }
+                  
+                  p + do.call(aes, aes_list) +
+                    geom_histogram(bins = input$bins,
+                                   position = if(input$color_by != "") "dodge" else "stack") +
                     theme_minimal()
                 },
                 "Bar Plot" = {
                   if (is.numeric(data[[input$x_var]])) {
-                    ggplot(data, aes_string(x = input$x_var)) +
-                      geom_bar() +
+                    p <- ggplot(data)
+                    
+                    # Build aesthetics for numeric bar plot
+                    aes_list <- list(x = as.name(input$x_var))
+                    if (input$color_by != "") {
+                      aes_list$fill <- as.name(input$color_by)
+                    }
+                    
+                    p + do.call(aes, aes_list) +
+                      geom_bar(position = if(input$color_by != "") "dodge" else "stack") +
                       theme_minimal()
                   } else {
-                    data %>%
-                      count(across(all_of(input$x_var))) %>%
-                      ggplot(aes_string(x = input$x_var, y = "n")) +
-                      geom_col() +
+                    # For categorical variables, count first
+                    if (input$color_by != "") {
+                      data_summary <- data %>%
+                        count(across(all_of(c(input$x_var, input$color_by))))
+                    } else {
+                      data_summary <- data %>%
+                        count(across(all_of(input$x_var)))
+                    }
+                    
+                    # Order levels by frequency if not colored
+                    if (input$color_by == "") {
+                      data_summary[[input$x_var]] <- factor(
+                        data_summary[[input$x_var]],
+                        levels = data_summary[[input$x_var]][order(data_summary$n, decreasing = TRUE)]
+                      )
+                    }
+                    
+                    p <- ggplot(data_summary)
+                    
+                    # Build aesthetics for categorical bar plot
+                    aes_list <- list(x = as.name(input$x_var), y = as.name("n"))
+                    if (input$color_by != "") {
+                      aes_list$fill <- as.name(input$color_by)
+                    }
+                    
+                    p + do.call(aes, aes_list) +
+                      geom_col(position = if(input$color_by != "") "dodge" else "stack") +
                       theme_minimal()
                   }
                 }
     )
     
+    # Add faceting if selected
+    if (input$facet_by != "") {
+      p <- p + facet_wrap(as.formula(paste("~", input$facet_by)))
+    }
+    
+    # Add labels and theme
     p + labs(title = input$plot_title,
              x = input$x_axis_label,
              y = input$y_axis_label) +
-      theme(plot.title = element_text(hjust = 0.5))
+      theme(plot.title = element_text(hjust = 0.5),
+            axis.text.x = element_text(angle = 45, hjust = 1))
   })
   
   # Display plot
@@ -345,6 +461,7 @@ server <- function(input, output, session) {
       ggsave(file, plot = current_plot(), width = 10, height = 7, dpi = 300)
     }
   )
+  
   # Statistical calculations
   stats_calculations <- reactive({
     req(input$x_var, filtered_data())
@@ -517,6 +634,12 @@ server <- function(input, output, session) {
   # Store saved plots and their descriptions
   saved_plots <- reactiveVal(list())
   
+  # Clear report
+  observeEvent(input$clear_report, {
+    saved_plots(list())
+    showNotification("Report cleared", type = "message")
+  })
+  
   # When save button is clicked, save current plot and stats
   observeEvent(input$save_current_plot, {
     req(current_plot())
@@ -578,8 +701,17 @@ server <- function(input, output, session) {
     do.call(tagList, plot_previews)
   })
   
-  # Replace the existing download_report handler with this updated version:
-  # Replace the existing download_report handler with this version:
+  # Preview report title
+  output$preview_title <- renderText({
+    input$report_title
+  })
+  
+  # Preview report description
+  output$preview_description <- renderText({
+    input$report_description
+  })
+  
+  # Download report handler
   output$download_report <- downloadHandler(
     filename = function() {
       paste0("analysis_report_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".html")
@@ -612,10 +744,11 @@ server <- function(input, output, session) {
       }
       
       # Create the Rmd content
+      # Create the Rmd content
       rmd_content <- c(
         "---",
         paste0('title: "', input$report_title, '"'),
-        'date: "`r format(Sys.time(), \'%B %d, %Y\')`"',
+        'date: "`r format(Sys.time(), \'%B %d, %Y\')`"',  # Fixed date line
         'output:',
         '  html_document:',
         '    self_contained: true',
@@ -625,13 +758,36 @@ server <- function(input, output, session) {
         '    highlight: tango',
         "---",
         "",
-        input$report_description,
+        gsub("\\n", "  \n", input$report_description),
         "",
         if(input$include_data_summary) {
           c(
             "## Data Summary",
-            paste("Number of observations:", nrow(filtered_data())),
-            paste("Number of variables:", ncol(filtered_data())),
+            "### Dataset Overview",
+            paste("- Number of observations:", nrow(filtered_data())),
+            paste("- Number of variables:", ncol(filtered_data())),
+            "",
+            "### Variable Summary",
+            sapply(names(filtered_data()), function(col) {
+              c(
+                paste("####", col),
+                if(is.numeric(filtered_data()[[col]])) {
+                  c(
+                    paste("- Type: Numeric"),
+                    paste("- Mean:", round(mean(filtered_data()[[col]], na.rm = TRUE), 2)),
+                    paste("- Median:", round(median(filtered_data()[[col]], na.rm = TRUE), 2)),
+                    paste("- Standard Deviation:", round(sd(filtered_data()[[col]], na.rm = TRUE), 2)),
+                    paste("- Range:", paste(round(range(filtered_data()[[col]], na.rm = TRUE), 2), collapse = " to "))
+                  )
+                } else {
+                  c(
+                    paste("- Type:", class(filtered_data()[[col]])),
+                    paste("- Unique values:", length(unique(filtered_data()[[col]]))),
+                    paste("- Most common:", names(sort(table(filtered_data()[[col]]), decreasing = TRUE)[1]))
+                  )
+                }
+              )
+            }),
             ""
           )
         },
@@ -641,7 +797,8 @@ server <- function(input, output, session) {
               paste("##", plots[[i]]$title),
               paste0("![](", plot_files[i], ")"),
               if(input$include_stats) {
-                c("### Statistical Analysis", plots[[i]]$stats)
+                c("Statistical Analysis \n\n", 
+                  strsplit(plots[[i]]$stats, "\n")[[1]])
               },
               ""
             )
@@ -669,4 +826,3 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui, server)
-
