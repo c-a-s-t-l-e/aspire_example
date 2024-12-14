@@ -5,6 +5,8 @@ library(ggplot2)
 library(dplyr)
 library(leaflet)
 library(withr)
+library(rmarkdown)
+library(tinytex)
 
 # Example datasets
 available_datasets <- list(
@@ -85,6 +87,7 @@ ui <- navbarPage(
                       value = "This report summarizes the analysis of our dataset."),
         actionButton("save_current_plot", "Add Current Plot to Report", class = "btn-success"),
         hr(),
+        checkboxInput("include_data_summary", "Include Data Summary", TRUE),
         checkboxInput("include_stats", "Include Statistical Analysis", TRUE),
         actionButton("clear_report", "Clear Report", class = "btn-danger"),
         hr(),
@@ -94,7 +97,9 @@ ui <- navbarPage(
         card_header("Report Preview"),
         card_body(
           h2(textOutput("preview_title")),
-          pre(style = "white-space: pre-wrap; font-family: inherit;", textOutput("preview_description")),
+          pre(style = "white-space: pre-wrap; font-family: inherit;", 
+              textOutput("preview_description")),
+          uiOutput("data_summary_preview"),
           hr(),
           uiOutput("saved_plots_preview"),
           verbatimTextOutput("report_preview")
@@ -109,6 +114,8 @@ server <- function(input, output, session) {
   current_data <- reactiveVal(NULL)
   # Reactive value to store the filtered dataset
   filtered_data <- reactiveVal(NULL)
+  # Add near the top of the server function
+  input_data_summary <- reactiveVal(TRUE)  # Default to TRUE
   
   # Update data when file is uploaded or dataset is selected
   observeEvent(list(input$dataset_choice, input$file), {
@@ -285,9 +292,10 @@ server <- function(input, output, session) {
   # Download handler for filtered data
   output$download_data <- downloadHandler(
     filename = function() {
-      paste0("filtered_data_", Sys.Date(), ".csv")
+      paste0("filtered_data_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv")
     },
     content = function(file) {
+      req(filtered_data())
       write.csv(filtered_data(), file, row.names = FALSE)
     }
   )
@@ -458,6 +466,7 @@ server <- function(input, output, session) {
       paste0("plot_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".png")
     },
     content = function(file) {
+      req(current_plot())
       ggsave(file, plot = current_plot(), width = 10, height = 7, dpi = 300)
     }
   )
@@ -467,163 +476,178 @@ server <- function(input, output, session) {
     req(input$x_var, filtered_data())
     data <- filtered_data()
     
-    # Initialize results
-    results <- list()
-    
-    # Basic summary statistics
-    results$summary <- summary(data[[input$x_var]])
-    
-    # Initialize output text with both simple and technical interpretations
-    output_text <- c(
-      "Quick Summary:",
-      paste(capture.output(results$summary), collapse = "\n"),
-      "\nSimple Interpretation:",
-      if(is.numeric(data[[input$x_var]])) {
-        paste("Most values of", input$x_var, "are around",
-              round(mean(data[[input$x_var]], na.rm = TRUE), 2),
-              ". The lowest value is",
-              round(min(data[[input$x_var]], na.rm = TRUE), 2),
-              "and the highest is",
-              round(max(data[[input$x_var]], na.rm = TRUE), 2), "."
-        )
-      } else {
-        paste("This data contains", length(unique(data[[input$x_var]])),
-              "different categories.")
-      },
-      "\nTechnical Details:",
-      if(is.numeric(data[[input$x_var]])) {
-        paste("Mean:", round(mean(data[[input$x_var]], na.rm = TRUE), 2),
-              "| SD:", round(sd(data[[input$x_var]], na.rm = TRUE), 2),
-              "| Range:", round(min(data[[input$x_var]], na.rm = TRUE), 2),
-              "to", round(max(data[[input$x_var]], na.rm = TRUE), 2))
-      } else {
-        paste("Categorical variable with",
-              length(unique(data[[input$x_var]])), "unique values")
-      }
-    )
-    
-    # Shapiro-Wilk test for numeric data
-    if (is.numeric(data[[input$x_var]]) && length(data[[input$x_var]]) >= 3) {
-      results$shapiro <- tryCatch(
-        shapiro.test(data[[input$x_var]]),
-        error = function(e) NULL
+    # Function to generate statistics for a dataset
+    generate_stats <- function(data, group_name = NULL) {
+      # Initialize results
+      results <- list()
+      
+      # Initialize output text
+      output_text <- c(
+        if(!is.null(group_name)) paste("\n=== Analysis for", group_name, "===") else "\n=== Overall Analysis ===",
+        "\nQuick Summary:",
+        paste(capture.output(summary(data[[input$x_var]])), collapse = "\n")
       )
       
-      if (!is.null(results$shapiro)) {
-        simple_shapiro <- if(results$shapiro$p.value < 0.05) {
-          "The data is not normally distributed (bell-shaped)."
-        } else {
-          "The data follows a normal (bell-shaped) distribution."
-        }
-        
-        technical_shapiro <- if(results$shapiro$p.value < 0.05) {
-          "Significantly deviates from normality (p < 0.05). Consider non-parametric methods."
-        } else {
-          "Normal distribution (p >= 0.05). Parametric tests appropriate."
-        }
-        
-        output_text <- c(output_text,
-                         "\nDistribution Check:",
-                         paste("Simple:", simple_shapiro),
-                         paste("Technical:", technical_shapiro),
-                         paste("Test Statistics: W =", round(results$shapiro$statistic, 4),
-                               ", p-value =", format.pval(results$shapiro$p.value)))
-      }
-    }
-    
-    # Scatter plot specific tests
-    if (input$plot_type == "Scatter Plot" && !is.null(input$y_var)) {
-      results$correlation <- tryCatch(
-        cor.test(data[[input$x_var]], data[[input$y_var]]),
-        error = function(e) NULL
-      )
-      
-      if (!is.null(results$correlation)) {
-        cor_strength <- abs(results$correlation$estimate)
-        cor_interpretation <- case_when(
-          cor_strength >= 0.7 ~ "strong",
-          cor_strength >= 0.3 ~ "moderate",
-          TRUE ~ "weak"
-        )
-        
-        # Simple interpretation
-        direction <- if(results$correlation$estimate > 0)
-          "as one increases, the other tends to increase"
-        else
-          "as one increases, the other tends to decrease"
-        
-        simple_cor <- paste("There is a", cor_interpretation, "relationship:", direction, ".",
-                            if(results$correlation$p.value < 0.05)
-                              "This pattern is reliable."
-                            else
-                              "This pattern might be by chance.")
-        
-        # Technical interpretation
-        technical_cor <- paste(
-          "Correlation coefficient (r) =", round(results$correlation$estimate, 4),
-          sprintf("(p %s 0.05)", ifelse(results$correlation$p.value < 0.05, "<", "≥"))
-        )
-        
-        output_text <- c(output_text,
-                         "\nRelationship Analysis:",
-                         paste("Simple:", simple_cor),
-                         paste("Technical:", technical_cor))
-      }
-      
-      # Regression analysis
-      results$regression <- tryCatch(
-        summary(lm(data[[input$y_var]] ~ data[[input$x_var]])),
-        error = function(e) NULL
-      )
-      
-      if (!is.null(results$regression)) {
-        # Simple interpretation
-        simple_reg <- paste("This relationship can explain",
-                            round(results$regression$r.squared * 100, 0),
-                            "% of the changes in", input$y_var, ".")
-        
-        # Technical interpretation
-        technical_reg <- paste(
-          "R² =", round(results$regression$r.squared, 4),
-          "| Adj.R² =", round(results$regression$adj.r.squared, 4),
-          "| Slope =", round(results$regression$coefficients[2,1], 4),
-          sprintf("(p %s 0.05)", ifelse(results$regression$coefficients[2,4] < 0.05, "<", "≥"))
-        )
-        
-        output_text <- c(output_text,
-                         "\nPredictive Analysis:",
-                         paste("Simple:", simple_reg),
-                         paste("Technical:", technical_reg))
-      }
-    }
-    
-    # Distribution shape analysis for histograms
-    if (input$plot_type == "Histogram" && is.numeric(data[[input$x_var]])) {
-      skewness <- (sum((data[[input$x_var]] - mean(data[[input$x_var]]))^3) /
-                     (length(data[[input$x_var]]) * sd(data[[input$x_var]])^3))
-      
-      # Simple interpretation
-      simple_skew <- case_when(
-        abs(skewness) < 0.5 ~ "values are spread evenly around the middle",
-        skewness >= 0.5 ~ "there are more low values with some high outliers",
-        skewness <= -0.5 ~ "there are more high values with some low outliers"
-      )
-      
-      # Technical interpretation
-      technical_skew <- case_when(
-        abs(skewness) < 0.5 ~ "approximately symmetric",
-        skewness >= 0.5 ~ "right-skewed (positively skewed)",
-        skewness <= -0.5 ~ "left-skewed (negatively skewed)"
-      )
-      
+      # Simple and Technical Interpretations
       output_text <- c(output_text,
-                       "\nShape Analysis:",
-                       paste("Simple: In this dataset,", simple_skew, "."),
-                       paste("Technical: Distribution is", technical_skew,
-                             "(skewness =", round(skewness, 4), ")"))
+                       "\nSimple Interpretation:",
+                       if(is.numeric(data[[input$x_var]])) {
+                         paste("Most values of", input$x_var, "are around",
+                               round(mean(data[[input$x_var]], na.rm = TRUE), 2),
+                               ". The lowest value is",
+                               round(min(data[[input$x_var]], na.rm = TRUE), 2),
+                               "and the highest is",
+                               round(max(data[[input$x_var]], na.rm = TRUE), 2), "."
+                         )
+                       } else {
+                         paste("This data contains", length(unique(data[[input$x_var]])),
+                               "different categories.")
+                       },
+                       "\nTechnical Details:",
+                       if(is.numeric(data[[input$x_var]])) {
+                         paste("Mean:", round(mean(data[[input$x_var]], na.rm = TRUE), 2),
+                               "| SD:", round(sd(data[[input$x_var]], na.rm = TRUE), 2),
+                               "| Range:", round(min(data[[input$x_var]], na.rm = TRUE), 2),
+                               "to", round(max(data[[input$x_var]], na.rm = TRUE), 2))
+                       } else {
+                         paste("Categorical variable with",
+                               length(unique(data[[input$x_var]])), "unique values")
+                       }
+      )
+      
+      # Shapiro-Wilk test for numeric data
+      if (is.numeric(data[[input$x_var]]) && length(data[[input$x_var]]) >= 3) {
+        results$shapiro <- tryCatch(
+          shapiro.test(data[[input$x_var]]),
+          error = function(e) NULL
+        )
+        
+        if (!is.null(results$shapiro)) {
+          simple_shapiro <- if(results$shapiro$p.value < 0.05) {
+            "The data is not normally distributed (bell-shaped)."
+          } else {
+            "The data follows a normal (bell-shaped) distribution."
+          }
+          
+          technical_shapiro <- if(results$shapiro$p.value < 0.05) {
+            "Significantly deviates from normality (p < 0.05). Consider non-parametric methods."
+          } else {
+            "Normal distribution (p >= 0.05). Parametric tests appropriate."
+          }
+          
+          output_text <- c(output_text,
+                           "\nDistribution Check:",
+                           paste("Simple:", simple_shapiro),
+                           paste("Technical:", technical_shapiro),
+                           paste("Test Statistics: W =", round(results$shapiro$statistic, 4),
+                                 ", p-value =", format.pval(results$shapiro$p.value)))
+        }
+      }
+      
+      # Scatter plot specific tests
+      if (input$plot_type == "Scatter Plot" && !is.null(input$y_var)) {
+        results$correlation <- tryCatch(
+          cor.test(data[[input$x_var]], data[[input$y_var]]),
+          error = function(e) NULL
+        )
+        
+        if (!is.null(results$correlation)) {
+          cor_strength <- abs(results$correlation$estimate)
+          cor_interpretation <- case_when(
+            cor_strength >= 0.7 ~ "strong",
+            cor_strength >= 0.3 ~ "moderate",
+            TRUE ~ "weak"
+          )
+          
+          direction <- if(results$correlation$estimate > 0)
+            "as one increases, the other tends to increase"
+          else
+            "as one increases, the other tends to decrease"
+          
+          simple_cor <- paste("There is a", cor_interpretation, "relationship:", direction, ".",
+                              if(results$correlation$p.value < 0.05)
+                                "This pattern is reliable."
+                              else
+                                "This pattern might be by chance.")
+          
+          technical_cor <- paste(
+            "Correlation coefficient (r) =", round(results$correlation$estimate, 4),
+            sprintf("(p %s 0.05)", ifelse(results$correlation$p.value < 0.05, "<", "≥"))
+          )
+          
+          output_text <- c(output_text,
+                           "\nRelationship Analysis:",
+                           paste("Simple:", simple_cor),
+                           paste("Technical:", technical_cor))
+          
+          # Regression analysis
+          results$regression <- tryCatch(
+            summary(lm(data[[input$y_var]] ~ data[[input$x_var]])),
+            error = function(e) NULL
+          )
+          
+          if (!is.null(results$regression)) {
+            simple_reg <- paste("This relationship can explain",
+                                round(results$regression$r.squared * 100, 0),
+                                "% of the changes in", input$y_var, ".")
+            
+            technical_reg <- paste(
+              "R² =", round(results$regression$r.squared, 4),
+              "| Adj.R² =", round(results$regression$adj.r.squared, 4),
+              "| Slope =", round(results$regression$coefficients[2,1], 4),
+              sprintf("(p %s 0.05)", ifelse(results$regression$coefficients[2,4] < 0.05, "<", "≥"))
+            )
+            
+            output_text <- c(output_text,
+                             "\nPredictive Analysis:",
+                             paste("Simple:", simple_reg),
+                             paste("Technical:", technical_reg))
+          }
+        }
+      }
+      
+      # Distribution shape analysis for histograms
+      if (input$plot_type == "Histogram" && is.numeric(data[[input$x_var]])) {
+        skewness <- (sum((data[[input$x_var]] - mean(data[[input$x_var]]))^3) /
+                       (length(data[[input$x_var]]) * sd(data[[input$x_var]])^3))
+        
+        simple_skew <- case_when(
+          abs(skewness) < 0.5 ~ "values are spread evenly around the middle",
+          skewness >= 0.5 ~ "there are more low values with some high outliers",
+          skewness <= -0.5 ~ "there are more high values with some low outliers"
+        )
+        
+        technical_skew <- case_when(
+          abs(skewness) < 0.5 ~ "approximately symmetric",
+          skewness >= 0.5 ~ "right-skewed (positively skewed)",
+          skewness <= -0.5 ~ "left-skewed (negatively skewed)"
+        )
+        
+        output_text <- c(output_text,
+                         "\nShape Analysis:",
+                         paste("Simple: In this dataset,", simple_skew, "."),
+                         paste("Technical: Distribution is", technical_skew,
+                               "(skewness =", round(skewness, 4), ")"))
+      }
+      
+      paste(output_text, collapse = "\n")
     }
     
-    paste(output_text, collapse = "\n")
+    # Generate overall statistics
+    all_stats <- generate_stats(data)
+    
+    # Generate statistics for each facet group if faceting is enabled
+    if (!is.null(input$facet_by) && input$facet_by != "") {
+      facet_groups <- split(data, data[[input$facet_by]])
+      facet_stats <- lapply(names(facet_groups), function(group) {
+        generate_stats(facet_groups[[group]], paste(input$facet_by, "=", group))
+      })
+      
+      # Combine overall and faceted statistics
+      paste(c(all_stats, unlist(facet_stats)), collapse = "\n\n")
+    } else {
+      all_stats
+    }
   })
   
   # Render statistical analysis
@@ -711,114 +735,254 @@ server <- function(input, output, session) {
     input$report_description
   })
   
+  # Add this output in the server function to render the data summary preview
+  output$data_summary_preview <- renderUI({
+    req(filtered_data())
+    if (!input$include_data_summary) return(NULL)
+    
+    data <- filtered_data()
+    
+    # Function to create summary for each column
+    create_col_summary <- function(col_name, col_data) {
+      if (is.numeric(col_data)) {
+        tagList(
+          h4(col_name),
+          p(strong("Numeric Variable Summary:")),
+          tags$ul(
+            tags$li(paste("Type:", class(col_data)[1])),
+            tags$li(paste("Minimum:", round(min(col_data, na.rm = TRUE), 2))),
+            tags$li(paste("Maximum:", round(max(col_data, na.rm = TRUE), 2))),
+            tags$li(paste("Mean:", round(mean(col_data, na.rm = TRUE), 2))),
+            tags$li(paste("Median:", round(median(col_data, na.rm = TRUE), 2))),
+            tags$li(paste("Standard Deviation:", round(sd(col_data, na.rm = TRUE), 2))),
+            tags$li(paste("Missing Values:", sum(is.na(col_data))))
+          )
+        )
+      } else {
+        freq_table <- table(col_data)
+        top_categories <- head(sort(freq_table, decreasing = TRUE), 5)
+        
+        tagList(
+          h4(col_name),
+          p(strong("Categorical Variable Summary:")),
+          tags$ul(
+            tags$li(paste("Type:", class(col_data)[1])),
+            tags$li(paste("Number of unique values:", length(unique(col_data)))),
+            tags$li(paste("Missing Values:", sum(is.na(col_data)))),
+            tags$li(
+              "Top 5 most frequent categories:",
+              tags$ul(
+                lapply(1:length(top_categories), function(i) {
+                  tags$li(paste0(
+                    names(top_categories)[i], ": ",
+                    top_categories[i], " (",
+                    round(100 * top_categories[i]/length(col_data), 1), "%)"
+                  ))
+                })
+              )
+            )
+          )
+        )
+      }
+    }
+    
+    # Create summary for dataset overview
+    overview <- tagList(
+      h2("Data Summary"),
+      h3("Dataset Overview"),
+      tags$ul(
+        tags$li(paste("Number of Observations:", nrow(data))),
+        tags$li(paste("Number of Variables:", ncol(data))),
+        tags$li("Types of Variables:",
+                tags$ul(
+                  tags$li(paste("Numeric:", sum(sapply(data, is.numeric)))),
+                  tags$li(paste("Character:", sum(sapply(data, is.character)))),
+                  tags$li(paste("Factor:", sum(sapply(data, is.factor))))
+                )
+        )
+      ),
+      h3("Variable Summaries")
+    )
+    
+    # Generate summary for each column
+    col_summaries <- lapply(names(data), function(col) {
+      create_col_summary(col, data[[col]])
+    })
+    
+    # Combine all elements
+    tagList(
+      hr(),
+      overview,
+      col_summaries
+    )
+  })
+  
   # Download report handler
+  
   output$download_report <- downloadHandler(
     filename = function() {
       paste0("analysis_report_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".html")
     },
     content = function(file) {
-      # Create a temporary directory within the session temp dir
       temp_dir <- tempfile()
-      dir.create(temp_dir, showWarnings = FALSE)
+      dir.create(temp_dir)
       on.exit(unlink(temp_dir, recursive = TRUE))
+      
+      # Create images directory
+      img_dir <- file.path(temp_dir, "images")
+      dir.create(img_dir)
       
       plots <- saved_plots()
       
-      # Create an images subdirectory
-      img_dir <- file.path(temp_dir, "images")
-      dir.create(img_dir, showWarnings = FALSE)
-      
       # Save plots as images
       plot_files <- character(length(plots))
-      if (length(plots) > 0) {
-        for (i in seq_along(plots)) {
-          plot_files[i] <- file.path("images", paste0("plot_", i, ".png"))
-          ggsave(
-            file.path(temp_dir, plot_files[i]),
-            plots[[i]]$plot,
-            width = 10,
-            height = 7,
-            dpi = 300
-          )
-        }
+      for(i in seq_along(plots)) {
+        plot_files[i] <- file.path("images", paste0("plot_", i, ".png"))
+        ggsave(
+          file.path(temp_dir, plot_files[i]),
+          plots[[i]]$plot,
+          width = 10,
+          height = 7,
+          dpi = 300
+        )
       }
       
-      # Create the Rmd content
-      # Create the Rmd content
+      # Create CSS for better formatting
+      css_content <- "
+    .stats-section {
+      margin: 20px 0;
+      padding: 15px;
+      background-color: #f8f9fa;
+      border-radius: 5px;
+    }
+    .stats-header {
+      color: #2c3e50;
+      margin-bottom: 10px;
+    }
+    .stats-content {
+      font-family: monospace;
+      white-space: pre-wrap;
+      margin-left: 20px;
+    }
+    .plot-section {
+      margin: 30px 0;
+      padding: 20px;
+      border: 1px solid #dee2e6;
+      border-radius: 8px;
+    }
+    .plot-title {
+      color: #2c3e50;
+      border-bottom: 2px solid #e9ecef;
+      padding-bottom: 10px;
+      margin-bottom: 20px;
+    }
+    "
+      
+      writeLines(css_content, file.path(temp_dir, "custom.css"))
+      
+      # Create Rmd content
       rmd_content <- c(
         "---",
         paste0('title: "', input$report_title, '"'),
-        'date: "`r format(Sys.time(), \'%B %d, %Y\')`"',  # Fixed date line
+        'date: "`r format(Sys.time(), \'%B %d, %Y\')`"',
         'output:',
         '  html_document:',
-        '    self_contained: true',
         '    toc: true',
         '    toc_float: true',
         '    theme: cosmo',
         '    highlight: tango',
+        '    css: custom.css',
+        '    code_folding: hide',
         "---",
         "",
-        gsub("\\n", "  \n", input$report_description),
+        "```{r setup, include=FALSE}",
+        "knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)",
+        "```",
         "",
-        if(input$include_data_summary) {
-          c(
-            "## Data Summary",
-            "### Dataset Overview",
-            paste("- Number of observations:", nrow(filtered_data())),
-            paste("- Number of variables:", ncol(filtered_data())),
-            "",
-            "### Variable Summary",
-            sapply(names(filtered_data()), function(col) {
-              c(
-                paste("####", col),
-                if(is.numeric(filtered_data()[[col]])) {
-                  c(
-                    paste("- Type: Numeric"),
-                    paste("- Mean:", round(mean(filtered_data()[[col]], na.rm = TRUE), 2)),
-                    paste("- Median:", round(median(filtered_data()[[col]], na.rm = TRUE), 2)),
-                    paste("- Standard Deviation:", round(sd(filtered_data()[[col]], na.rm = TRUE), 2)),
-                    paste("- Range:", paste(round(range(filtered_data()[[col]], na.rm = TRUE), 2), collapse = " to "))
-                  )
-                } else {
-                  c(
-                    paste("- Type:", class(filtered_data()[[col]])),
-                    paste("- Unique values:", length(unique(filtered_data()[[col]]))),
-                    paste("- Most common:", names(sort(table(filtered_data()[[col]]), decreasing = TRUE)[1]))
-                  )
-                }
-              )
-            }),
-            ""
-          )
-        },
-        if(length(plots) > 0) {
-          unlist(lapply(seq_along(plots), function(i) {
-            c(
-              paste("##", plots[[i]]$title),
-              paste0("![](", plot_files[i], ")"),
-              if(input$include_stats) {
-                c("Statistical Analysis \n\n", 
-                  strsplit(plots[[i]]$stats, "\n")[[1]])
-              },
-              ""
-            )
-          }))
-        }
+        "## Description",
+        "",
+        input$report_description,
+        ""
       )
       
-      # Write Rmd content to file
-      rmd_file <- file.path(temp_dir, "report.Rmd")
-      writeLines(paste(rmd_content, collapse = "\n"), rmd_file)
-      
-      # Set working directory temporarily to temp_dir
-      withr::with_dir(temp_dir, {
-        # Render with explicit options
-        rmarkdown::render(
-          "report.Rmd",
-          output_file = file,
-          quiet = TRUE,
-          encoding = "UTF-8"
+      # Add data summary if requested
+      # Add data summary if requested
+      if (input$include_data_summary) {
+        data <- filtered_data()
+        summary_content <- c(
+          "## Data Summary",
+          "",
+          "### Dataset Overview",
+          sprintf("* Number of Observations: %d", nrow(data)),
+          sprintf("* Number of Variables: %d", ncol(data)),
+          "",
+          "### Variable Types",
+          sprintf("* Numeric Variables: %d", sum(sapply(data, is.numeric))),
+          sprintf("* Character Variables: %d", sum(sapply(data, is.character))),
+          sprintf("* Factor Variables: %d", sum(sapply(data, is.factor))),
+          "",
+          "### First Few Rows",
+          "<div style='overflow-x: auto;'>",
+          "```{r}",
+          "knitr::kable(head(filtered_data(), 5), 
+                  format = 'html',
+                  align = rep('c', ncol(filtered_data())),
+                  table.attr = 'class=\"table table-striped table-bordered\" style=\"width: auto !important; margin-left: auto; margin-right: auto; font-size: 14px;\"')",
+          "```",
+          "</div>",
+          "",
+          "### Summary Statistics",
+          "```{r}",
+          "summary(filtered_data())",
+          "```"
         )
+        rmd_content <- c(rmd_content, summary_content)
+      }
+      
+      # Add plots and statistics
+      if (length(plots) > 0) {
+        for (i in seq_along(plots)) {
+          plot_content <- c(
+            paste("## Plot", i, ":", plots[[i]]$title),
+            "",
+            '<div class="plot-section">',
+            paste0('<div class="plot-title">', plots[[i]]$title, '</div>'),
+            paste0("![](", plot_files[i], ")"),
+            "</div>"
+          )
+          
+          if (input$include_stats) {
+            stats_text <- plots[[i]]$stats
+            stats_content <- c(
+              "### Statistical Analysis",
+              '<div class="stats-section">',
+              paste0('<div class="stats-content">', stats_text, '</div>'),
+              "</div>"
+            )
+            plot_content <- c(plot_content, stats_content)
+          }
+          
+          rmd_content <- c(rmd_content, plot_content, "")
+        }
+      }
+      
+      # Write Rmd file
+      writeLines(rmd_content, file.path(temp_dir, "report.Rmd"))
+      
+      # Render the report
+      withr::with_dir(temp_dir, {
+        rmarkdown::render("report.Rmd",
+                          output_format = rmarkdown::html_document(
+                            toc = TRUE,
+                            toc_float = TRUE,
+                            theme = "cosmo",
+                            highlight = "tango",
+                            css = "custom.css",
+                            code_folding = "hide"
+                          ),
+                          output_file = file,
+                          quiet = TRUE,
+                          encoding = "UTF-8")
       })
     },
     contentType = "text/html"
